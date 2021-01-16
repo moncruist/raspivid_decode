@@ -8,8 +8,7 @@ use tokio::runtime::Builder;
 use std::error::Error;
 use std::net::SocketAddr;
 
-use ffmpeg_sys_next::{self, AVCodecContext, AVCodecID};
-use crate::RaspividError::{CodecNotFound, OpenError};
+use ffmpeg_sys_next::{self, AVCodecContext, AVCodecID, AVFrame, AVCodecParserContext};
 use std::fmt::Formatter;
 
 #[derive(Clap)]
@@ -25,7 +24,7 @@ struct RaspividDecoder {
 #[derive(Debug)]
 enum RaspividError {
     CodecNotFound,
-    OpenError(i32)
+    OpenError(i32),
 }
 
 impl std::error::Error for RaspividError {}
@@ -41,12 +40,12 @@ impl RaspividDecoder {
         unsafe {
             let codec = ffmpeg_sys_next::avcodec_find_decoder(AVCodecID::AV_CODEC_ID_H264);
             if codec.is_null() {
-                return Err(CodecNotFound);
+                return Err(RaspividError::CodecNotFound);
             }
             let ctx = ffmpeg_sys_next::avcodec_alloc_context3(codec);
             let result = ffmpeg_sys_next::avcodec_open2(ctx, codec, std::ptr::null_mut());
             if result < 0 {
-                return Err(OpenError(result));
+                return Err(RaspividError::OpenError(result));
             }
             Ok(RaspividDecoder { av_ctx: ctx })
         }
@@ -59,6 +58,44 @@ impl Drop for RaspividDecoder {
             unsafe {
                 ffmpeg_sys_next::avcodec_free_context(&mut self.av_ctx);
             }
+        }
+    }
+}
+
+struct RaspividFrame {
+    frame: *mut AVFrame,
+}
+
+impl RaspividFrame {
+    pub fn new() -> RaspividFrame {
+        let frame = unsafe { ffmpeg_sys_next::av_frame_alloc() };
+        RaspividFrame { frame }
+    }
+}
+
+impl Drop for RaspividFrame {
+    fn drop(&mut self) {
+        if !self.frame.is_null() {
+            unsafe { ffmpeg_sys_next::av_frame_free(&mut self.frame); }
+        }
+    }
+}
+
+struct RaspividParser {
+    parser: *mut AVCodecParserContext,
+}
+
+impl RaspividParser {
+    pub fn new() -> RaspividParser {
+        let parser = unsafe { ffmpeg_sys_next::av_parser_init() };
+        RaspividParser { parser }
+    }
+}
+
+impl Drop for RaspividParser {
+    fn drop(&mut self) {
+        if !self.parser.is_null() {
+            unsafe { ffmpeg_sys_next::av_parser_close(self.parser); }
         }
     }
 }
@@ -80,6 +117,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 async fn logic_loop(server_addr: String) -> Result<(), Box<dyn Error>> {
     let decoder = RaspividDecoder::new()?;
+    let frame = RaspividFrame::new();
 
     let addr = server_addr.parse::<SocketAddr>()?;
 
@@ -92,7 +130,7 @@ async fn logic_loop(server_addr: String) -> Result<(), Box<dyn Error>> {
         let ready = stream.ready(Interest::READABLE).await?;
 
         if ready.is_readable() {
-            let mut bytes_read: usize = 0;
+            let bytes_read: usize;
             match stream.read(&mut buf).await {
                 Ok(n) => bytes_read = n,
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => continue,
@@ -100,8 +138,11 @@ async fn logic_loop(server_addr: String) -> Result<(), Box<dyn Error>> {
             }
 
             if bytes_read == 0 {
+                println!("Transmission end");
                 break;
             }
+
+            println!("Read bytes: {}", bytes_read);
         }
     }
 
