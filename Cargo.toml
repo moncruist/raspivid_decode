@@ -10,3 +10,4 @@ edition = "2018"
 ffmpeg-sys-next = "^4.3.0"
 clap = "3.0.0-beta"
 tokio = { version = "1.0", features = ["full"] }
+libc = "0.2"
