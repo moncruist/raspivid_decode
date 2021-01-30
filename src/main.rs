@@ -13,6 +13,11 @@ use std::fmt::Formatter;
 
 use libc;
 
+use sdl2::event::Event;
+use sdl2::keyboard::Keycode;
+use sdl2::pixels::PixelFormatEnum;
+use sdl2::rect::Rect;
+
 #[derive(Clap)]
 #[clap(version = "0.1")]
 struct Opts {
@@ -91,7 +96,7 @@ impl RaspividDecoder {
         }
     }
 
-    pub fn decode_data<F: FnMut(&[u8], usize, usize, usize)>(
+    pub fn decode_data<F: FnMut(&[u8], &[u8], &[u8], usize, usize, usize, usize, usize)>(
         &self,
         data: &[u8],
         mut decode_handler: F,
@@ -138,18 +143,43 @@ impl RaspividDecoder {
                         return Err(RaspividError::AVCodecReceiveFrameError(ret));
                     }
 
-                    let line_size = unsafe { self.frame.as_ref().unwrap().linesize[0] as usize };
+                    let y_line_size = unsafe { self.frame.as_ref().unwrap().linesize[0] as usize };
+                    let u_line_size = unsafe { self.frame.as_ref().unwrap().linesize[1] as usize };
+                    let v_line_size = unsafe { self.frame.as_ref().unwrap().linesize[2] as usize };
                     let width = unsafe { self.frame.as_ref().unwrap().width as usize };
                     let height = unsafe { self.frame.as_ref().unwrap().height as usize };
 
-                    let frame_data = unsafe {
+                    let y_data = unsafe {
                         std::slice::from_raw_parts(
                             self.frame.as_ref().unwrap().data[0],
-                            line_size * width,
+                            y_line_size * height,
                         )
                     };
 
-                    decode_handler(frame_data, line_size, width, height);
+                    let u_data = unsafe {
+                        std::slice::from_raw_parts(
+                            self.frame.as_ref().unwrap().data[1],
+                            u_line_size * height / 2,
+                        )
+                    };
+
+                    let v_data = unsafe {
+                        std::slice::from_raw_parts(
+                            self.frame.as_ref().unwrap().data[2],
+                            v_line_size * height / 2,
+                        )
+                    };
+
+                    decode_handler(
+                        y_data,
+                        u_data,
+                        v_data,
+                        y_line_size,
+                        u_line_size,
+                        v_line_size,
+                        width,
+                        height,
+                    );
 
                     if ret == 0 {
                         break;
@@ -206,6 +236,24 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 async fn logic_loop(server_addr: String) -> Result<(), Box<dyn Error>> {
+    let sdl_context = sdl2::init().unwrap();
+    let video_subsystem = sdl_context.video().unwrap();
+    let window = video_subsystem
+        .window("Ruspivid Decode", 800, 600)
+        .position_centered()
+        .resizable()
+        .build()
+        .unwrap();
+    let mut canvas = window.into_canvas().build().unwrap();
+    let texture_creator = canvas.texture_creator();
+    let mut texture = texture_creator
+        .create_texture_streaming(PixelFormatEnum::IYUV, 800 as u32, 600 as u32)
+        .unwrap();
+    canvas.clear();
+    canvas.present();
+
+    let mut event_pump = sdl_context.event_pump().unwrap();
+
     let decoder = RaspividDecoder::new()?;
 
     let addr = server_addr.parse::<SocketAddr>()?;
@@ -215,7 +263,7 @@ async fn logic_loop(server_addr: String) -> Result<(), Box<dyn Error>> {
     const BUF_SIZE: usize = 4096;
     let mut buf: [u8; BUF_SIZE] = [0; BUF_SIZE];
 
-    loop {
+    'main_loop: loop {
         let ready = stream.ready(Interest::READABLE).await?;
 
         if ready.is_readable() {
@@ -231,9 +279,53 @@ async fn logic_loop(server_addr: String) -> Result<(), Box<dyn Error>> {
                 break;
             }
 
-            decoder.decode_data(&buf, |_data, _line_size, width, height| {
-                println!("Recv new frame (WxH): {}x{}", width, height);
-            })?;
+            decoder.decode_data(
+                &buf,
+                |y_data, u_data, v_data, y_line_size, u_line_size, v_line_size, width, height| {
+                    let (window_width, window_height) = canvas.window().size();
+                    if (width != window_width as usize) || (height != window_height as usize) {
+                        canvas
+                            .window_mut()
+                            .set_size(width as u32, height as u32)
+                            .unwrap();
+                        canvas.clear();
+
+                        texture = texture_creator
+                            .create_texture_streaming(
+                                PixelFormatEnum::IYUV,
+                                width as u32,
+                                height as u32,
+                            )
+                            .unwrap();
+                    }
+
+                    texture
+                        .update_yuv(
+                            Rect::new(0, 0, width as u32, height as u32),
+                            y_data,
+                            y_line_size,
+                            u_data,
+                            u_line_size,
+                            v_data,
+                            v_line_size,
+                        )
+                        .unwrap();
+
+                    canvas.copy(&texture, None, None).unwrap();
+                    canvas.present();
+                },
+            )?;
+        }
+
+        for event in event_pump.poll_iter() {
+            match event {
+                Event::Quit { .. }
+                | Event::KeyDown {
+                    keycode: Some(Keycode::Escape),
+                    ..
+                } => break 'main_loop,
+                _ => {}
+            }
         }
     }
 
